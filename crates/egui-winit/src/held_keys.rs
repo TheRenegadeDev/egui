@@ -24,7 +24,7 @@ impl Identity {
 
 #[derive(Default)]
 pub(super) struct HeldKeys {
-    // None records a clipboard shortcut: no egui Key-down was emitted for it,
+    // None records a clipboard shortcut or synthetic focus-gain press: no egui Key-down was emitted,
     // so its release must not clear another physical key's egui identity. If the
     // same physical key later repeats as an ordinary press (for example after
     // Ctrl is released while the key is still held), the marker is upgraded so
@@ -33,6 +33,11 @@ pub(super) struct HeldKeys {
 }
 
 impl HeldKeys {
+    pub fn is_held(&self, physical: PhysicalKey, logical: Option<egui::Key>) -> bool {
+        Identity::new(physical, logical)
+            .is_some_and(|identity| self.pressed.contains_key(&identity))
+    }
+
     pub fn press(
         &mut self,
         physical: PhysicalKey,
@@ -44,7 +49,7 @@ impl HeldKeys {
         let identity = Identity::new(physical, logical)?;
         match self.pressed.entry(identity) {
             Entry::Occupied(mut entry) => {
-                // A clipboard shortcut records `None` because it emitted no egui
+                // A non-actionable press records `None` because it emitted no egui
                 // Key-down. If the same physical key later produces an ordinary
                 // press (e.g. Ctrl was released while the key is still held and
                 // its repeat now carries normal text), upgrade the marker so the
@@ -120,6 +125,81 @@ mod tests {
 
     fn feed_state(ctx: &egui::Context, state: &mut State) {
         feed(ctx, core::mem::take(&mut state.egui_input.events));
+    }
+
+    #[test]
+    fn synthetic_focus_gain_makes_the_first_x11_press_a_repeat_without_an_action() {
+        for key in [Key::N, Key::Y] {
+            let ctx = egui::Context::default();
+            let mut state = test_state(ctx.clone());
+            let code = physical(if key == Key::N {
+                KeyCode::KeyN
+            } else {
+                KeyCode::KeyY
+            });
+            // Pinned X11 reports the focus snapshot and first ordinary repeat as false.
+            // Remembering the synthetic snapshot must emit no Key, Text or shortcut event.
+            state.remember_synthetic_key_press(code, (key == Key::N).then_some(key));
+            assert!(state.egui_input().events.is_empty());
+            state.press_keyboard_input(code, Some(key), Some(key), false);
+            assert!(matches!(
+                state.egui_input().events.as_slice(),
+                [Event::Key { repeat: true, .. }]
+            ));
+            feed_state(&ctx, &mut state);
+            assert!(
+                ctx.input(|i| matches!(i.events.as_slice(), [Event::Key { repeat: true, .. }]))
+            );
+            state.release_keyboard_input(code);
+            feed_state(&ctx, &mut state);
+            assert!(!ctx.input(|i| i.key_down(key)));
+        }
+    }
+
+    #[test]
+    fn synthetic_focus_snapshot_release_or_focus_loss_allows_a_fresh_press() {
+        for (key, code) in [(Key::N, KeyCode::KeyN), (Key::Y, KeyCode::KeyY)] {
+            for release in [false, true] {
+                let ctx = egui::Context::default();
+                let mut state = test_state(ctx.clone());
+                let code = physical(code);
+                state.remember_synthetic_key_press(code, Some(key));
+                if release {
+                    // Released before any ordinary repeat: no down was emitted to pair with it.
+                    state.release_keyboard_input(code);
+                    assert!(state.egui_input().events.is_empty());
+                } else {
+                    // Released elsewhere while unfocused: the next gain has no held-key snapshot.
+                    state.held_keys.clear();
+                    feed(&ctx, vec![Event::WindowFocused(false)]);
+                }
+                state.press_keyboard_input(code, Some(key), Some(key), false);
+                assert!(matches!(
+                    state.egui_input().events.as_slice(),
+                    [Event::Key { repeat: false, .. }]
+                ));
+                feed_state(&ctx, &mut state);
+                state.release_keyboard_input(code);
+                feed_state(&ctx, &mut state);
+                assert!(!ctx.input(|i| i.key_down(key)));
+            }
+        }
+    }
+
+    #[test]
+    fn synthetic_clipboard_key_emits_no_shortcut_or_text() {
+        let mut state = test_state(egui::Context::default());
+        let code = physical(KeyCode::KeyC);
+        state.modifiers = Modifiers::COMMAND;
+        state.remember_synthetic_key_press(code, Some(Key::C));
+        assert!(state.egui_input().events.is_empty());
+        state.release_keyboard_input(code);
+        assert!(state.egui_input().events.is_empty());
+        assert!(
+            state.try_clipboard_shortcut(code, Some(Key::C)),
+            "a fresh real shortcut still works"
+        );
+        assert_eq!(state.egui_input().events, vec![Event::Copy]);
     }
 
     #[test]
@@ -406,7 +486,13 @@ mod tests {
         );
         assert_eq!(
             state.egui_input().events,
-            vec![state_key_event(Key::C, Some(Key::C), true, Modifiers::NONE)]
+            vec![Event::Key {
+                key: Key::C,
+                physical_key: Some(Key::C),
+                pressed: true,
+                repeat: true,
+                modifiers: Modifiers::NONE,
+            }]
         );
         feed_state(&ctx, &mut state);
         assert!(ctx.input(|i| i.key_down(Key::C)));
@@ -465,7 +551,11 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(repeats, vec![false], "egui fills in `repeat` itself");
+        assert_eq!(
+            repeats,
+            vec![true],
+            "the adapter already knows this physical key is held"
+        );
         feed_state(&ctx, &mut state);
         assert!(ctx.input(|i| i.key_down(Key::Z)));
         assert_eq!(ctx.input(|i| i.num_presses(Key::Z)), 1);

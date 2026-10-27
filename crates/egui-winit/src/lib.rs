@@ -2250,8 +2250,13 @@ impl State {
                 if *is_synthetic && event.state == ElementState::Pressed {
                     // Winit generates fake "synthetic" KeyboardInput events when the focus
                     // is changed to the window, or away from it. Synthetic key presses
-                    // represent no real key presses and should be ignored.
+                    // must not emit input. Retain their held-key provenance: X11 marks the
+                    // first ordinary repeat after focus gain as a non-repeat too.
                     // See https://github.com/rust-windowing/winit/issues/3543
+                    self.remember_synthetic_key_press(
+                        event.physical_key,
+                        key_from_winit_key(&event.logical_key),
+                    );
                     EventResponse {
                         repaint: true,
                         consumed: false,
@@ -3084,8 +3089,16 @@ impl State {
         }
     }
 
-    /// Emit an ordinary key press for a physical key, using the identity that
-    /// egui already received for it if it is still held (a repeat).
+    /// Remember a focus snapshot without emitting a key, text, or clipboard action.
+    fn remember_synthetic_key_press(
+        &mut self,
+        physical: winit::keyboard::PhysicalKey,
+        logical: Option<egui::Key>,
+    ) {
+        let _ = self.held_keys.press(physical, logical, false);
+    }
+
+    /// Emit an ordinary press, preserving both native repeat and held-at-focus-gain identity.
     fn press_keyboard_input(
         &mut self,
         physical: winit::keyboard::PhysicalKey,
@@ -3093,6 +3106,7 @@ impl State {
         translated: Option<egui::Key>,
         repeat: bool,
     ) -> Option<egui::Key> {
+        let repeat = repeat || self.held_keys.is_held(physical, translated);
         let active_key = self.held_keys.press(physical, translated, true)?;
         self.egui_input.events.push(egui::Event::Key {
             key: active_key,
